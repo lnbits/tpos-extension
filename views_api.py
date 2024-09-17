@@ -3,6 +3,7 @@ from http import HTTPStatus
 
 import httpx
 from fastapi import APIRouter, Depends, Query, Request
+from lnbits import bolt11
 from lnbits.core.crud import (
     get_latest_payments_by_extension,
     get_standalone_payment,
@@ -169,6 +170,7 @@ async def api_tpos_get_latest_invoices(tpos_id: str):
 async def api_tpos_pay_invoice(
     lnurl_data: PayLnurlWData, payment_request: str, tpos_id: str
 ):
+    logger.debug(f"1st call lnurl_data: {lnurl_data}")
     tpos = await get_tpos(tpos_id)
 
     if not tpos:
@@ -197,28 +199,90 @@ async def api_tpos_pay_invoice(
                 lnurl_response = {"success": False, "detail": "Error loading"}
             else:
                 resp = r.json()
-                if resp["tag"] != "withdrawRequest":
+                logger.debug(f"1st call resp: {resp}")
+                if resp.get("tag") != "withdrawRequest":
                     lnurl_response = {"success": False, "detail": "Wrong tag type"}
+
+                elif resp.get("pinLimit"):
+                    logger.debug(
+                        f"PIN required for this amount: {resp.get('pinLimit')}"
+                    )
+                    invoice = bolt11.decode(payment_request)
+                    if invoice.amount_msat >= resp.get("pinLimit"):
+                        return {
+                            "success": True,
+                            "detail": "PIN required for this amount",
+                            "callback": resp.get("callback"),
+                            "k1": resp.get("k1"),
+                        }
                 else:
+                    logger.debug(
+                        f"all clear making callback to: {resp.get('callback')}"
+                    )
                     r2 = await client.get(
-                        resp["callback"],
+                        resp.get("callback"),
                         follow_redirects=True,
                         headers=headers,
                         params={
-                            "k1": resp["k1"],
+                            "k1": resp.get("k1"),
                             "pr": payment_request,
                         },
                     )
                     resp2 = r2.json()
+                    logger.debug(f"2nd call resp2 OK: {resp2}")
                     if r2.is_error:
                         lnurl_response = {
                             "success": False,
                             "detail": "Error loading callback",
                         }
-                    elif resp2["status"] == "ERROR":
-                        lnurl_response = {"success": False, "detail": resp2["reason"]}
+                    elif resp2.get("status") == "ERROR":
+                        lnurl_response = {
+                            "success": False,
+                            "detail": resp2.get("reason"),
+                        }
                     else:
                         lnurl_response = {"success": True, "detail": resp2}
+        except (httpx.ConnectError, httpx.RequestError):
+            lnurl_response = {"success": False, "detail": "Unexpected error occurred"}
+    logger.debug(f"lnurl_response: {lnurl_response}")
+    return lnurl_response
+
+
+@tpos_api_router.get(
+    "/api/v1/tposs/{tpos_id}/invoices/{payment_request}/pay",
+    status_code=HTTPStatus.OK,
+)
+async def api_tpos_pay_invoice_cb(
+    payment_request: str,
+    tpos_id: str,
+    cb: str = Query(None),
+):
+    tpos = await get_tpos(tpos_id)
+    logger.debug(f"2nd call cb: {cb}")
+
+    if not tpos:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND, detail="TPoS does not exist."
+        )
+
+    async with httpx.AsyncClient() as client:
+        try:
+            headers = {"user-agent": "lnbits/tpos"}
+            r = await client.get(
+                cb,
+                follow_redirects=True,
+                headers=headers,
+            )
+            r_json = r.json()
+            if r.is_error:
+                lnurl_response = {
+                    "success": False,
+                    "detail": "Error loading callback",
+                }
+            elif r_json["status"] == "ERROR":
+                lnurl_response = {"success": False, "detail": r_json["reason"]}
+            else:
+                lnurl_response = {"success": True, "detail": r_json}
         except (httpx.ConnectError, httpx.RequestError):
             lnurl_response = {"success": False, "detail": "Unexpected error occurred"}
 
